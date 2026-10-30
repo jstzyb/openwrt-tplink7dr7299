@@ -1,0 +1,522 @@
+name: build-tl-7dr7299-openwrt
+
+# 路线 B：GitHub Actions 云端编译 TP-Link TL-7DR7299 v1
+# 用法（不需要本机装 git）：
+#   1) 在 GitHub 新建仓库，把本文件按原路径上传： .github/workflows/build.yml
+#   2) Actions 标签页 → 选择本工作流 → Run workflow → 选参数 → Run workflow
+#   3) 编译完在 job 底部的 Artifacts 里下载 zip，里面就是 .itb 固件
+#
+# 说明：feeds.conf 与 .config.seed 全部写在下面的 here-doc 里，仓库里只需要这一个文件。
+#
+# 已确认的默认网口分配（源码 board.d/02_network）：
+#   lan = lan1 lan2 lan3 lan4 lan5 lan6 sfp     ← 光口在源码里叫 sfp，默认在 LAN 上
+#   wan = eth1                                  ← 默认 WAN 是一个电口
+# 本工作流默认把光口 sfp 改成 WAN，并把腾出来的 eth1 加回 LAN（不想改就把 wan_device 留空）。
+# 另外内置 TTYD 网页终端（http://管理IP:7681），LAN 管理地址默认改成了 192.168.6.1。
+
+on:
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: '源码仓库（owner/name）'
+        required: false
+        default: 'WoChen5770/imoutowrt'
+      branch:
+        description: '源码分支'
+        required: false
+        default: 'master-mediatek-7dr7299'
+      variant:
+        description: '编译版本：full=全功能 / slim=精简（省闪存） / both=两个都编'
+        required: false
+        default: 'both'
+        type: choice
+        options:
+          - both
+          - full
+          - slim
+      diagnose_only:
+        description: 'yes=只做体检（10 分钟，不编译，先看包名/分区是否正确）'
+        required: false
+        default: 'no'
+        type: choice
+        options:
+          - 'no'
+          - 'yes'
+      overlay_mb:
+        description: 'NAND 的 overlay 可用容量(MB)，用于容量告警（原厂一般 30~40）'
+        required: false
+        default: '30'
+      lan_ip:
+        description: 'LAN 管理地址（刷完第一次开机自动生效；填 none 表示不改）'
+        required: false
+        default: '192.168.6.1'
+      wan_device:
+        description: 'WAN 绑哪个口：光口=sfp / 2.5G 电口=eth1 / 留空=不改沿用源码默认(eth1)'
+        required: false
+        default: 'sfp'
+      wan_proto:
+        description: 'WAN 拨号方式（光口大多用 dhcp；运营商给宽带账号就选 pppoe）'
+        required: false
+        default: 'dhcp'
+        type: choice
+        options:
+          - dhcp
+          - pppoe
+          - none
+      wan_vlan:
+        description: 'WAN 是否需要打 VLAN tag（电信/移动常见 45、41 之类；留空=不打 tag）'
+        required: false
+        default: ''
+      wan_user:
+        description: 'PPPoE 账号（wan_proto=pppoe 时才填）'
+        required: false
+        default: ''
+      wan_pass:
+        description: 'PPPoE 密码（wan_proto=pppoe 时才填）'
+        required: false
+        default: ''
+      lan_extra_ports:
+        description: '光口挪去 WAN 后，空出来的口加回 LAN（默认 eth1；不需要就留空）'
+        required: false
+        default: 'eth1'
+
+permissions:
+  contents: read
+
+env:
+  DEVICE: tplink_tl-7dr7299-v1
+  DEBIAN_FRONTEND: noninteractive
+
+jobs:
+  build:
+    name: ${{ matrix.variant }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 280
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: ${{ fromJSON(inputs.variant == 'both' && '["full","slim"]' || format('["{0}"]', inputs.variant)) }}
+
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.branch }}
+          fetch-depth: 1
+
+      - name: 释放磁盘空间
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL || true
+          sudo apt-get -qq clean
+          sudo systemctl stop docker docker.service docker.socket || true
+          sudo rm -rf /var/lib/docker/image /var/lib/containers || true
+          echo "=== 磁盘 ==="; df -h / ; echo
+
+      - name: 安装编译依赖
+        run: |
+          sudo apt-get -qq update
+          sudo apt-get -qq install -y build-essential clang flex bison g++ g++-multilib \
+            gcc-multilib gettext git libncurses-dev libncursesw5-dev libssl-dev libelf-dev \
+            libpcre2-dev zlib1g-dev uuid-dev rsync swig unzip time wget curl ccache file \
+            device-tree-compiler python3 python3-setuptools cmake pkg-config autoconf \
+            automake libtool libtinfo-dev libffi-dev
+          git config --global user.email "ci@localhost"
+          git config --global user.name "ci"
+
+      - name: 写入插件源 feeds.conf
+        run: |
+          # 先沿用源码自带的 feeds（分支/版本与源码匹配），再追加第三方插件源；已有的同名源不重复添加
+          cp feeds.conf.default feeds.conf
+          add_feed() {
+            if grep -qE "^src-[a-z]+[[:space:]]+$1([[:space:];]|$)" feeds.conf; then
+              echo "已存在 feed: $1（沿用源码自带）"
+            else
+              echo "src-git $1 $2" >> feeds.conf
+              echo "新增 feed: $1 -> $2"
+            fi
+          }
+          add_feed helloworld        https://github.com/fw876/helloworld.git
+          add_feed passwall_packages https://github.com/fw9229907/luci-app-passwall.git
+          add_feed openclash         https://github.com/vernesx/DevService.git
+          # 需要 iStore（在线装插件、给 OpenClash 上传核心）时取消下一行注释：
+          # add_feed istore https://github.com/linkease/istore-ui.git
+          # 上面第三方源若改名或 404，编译不会中断，只会在“插件可用性体检”里标成 MISS
+          echo "=== feeds.conf ==="; cat feeds.conf
+
+      - name: 核对机型定义与分区信息
+        run: |
+          echo "=== mediatek 目录下的 image/*.mk ==="
+          ls target/linux/mediatek/*.mk || true
+          echo "=== 搜索机型 $DEVICE ==="
+          if ! grep -rq "7dr7299" target/linux/mediatek ; then
+            echo "::error::源码里没有 7dr7299 机型定义，请确认 repository/branch（或改用 padavanonly/immortalwrt-mt798x-6.6 + mt798x-mt799x-6.6-mtwifi）"
+            exit 1
+          fi
+          echo "=== 机型定义与分区参数（这里能看出 rootfs/ubi 分区大小）==="
+          grep -rn -A 24 "7dr7299" target/linux/mediatek | head -160
+          echo "=== 默认网口分配（lan / wan 对应的设备名，改 WAN 前先看这里）==="
+          grep -rn -B 3 -A 3 "7dr7299" target/linux/mediatek/filogic/base-files/etc/board.d/02_network 2>/dev/null || true
+
+      - name: 更新并安装 feeds
+        run: |
+          while read -r line; do
+            case "$line" in ''|'#'*) continue ;; esac
+            feed=$(printf '%s\n' "$line" | awk '{print $2}')
+            echo "--- feed: $feed"
+            ./scripts/feeds update -f "$feed" || echo "::warning::feed $feed 拉取失败（下面体检会显示哪些插件缺失）"
+          done < feeds.conf
+          ./scripts/feeds install -a -p packages || true
+          ./scripts/feeds install -a -p luci || true
+          ./scripts/feeds install -a || true
+
+      - name: 插件可用性体检
+        run: |
+          echo "=== 插件包在 feeds 里是否存在 ==="
+          for p in luci-app-adblock adblock luci-app-openclash openclash luci-app-passwall \
+                   luci-app-turboacc turboacc-collection kmod-mediatek_hnat ssr-plus \
+                   istore luci-app-simple-ac mosdns luci-app-ttyd ttyd; do
+            hit=$(find package feeds -maxdepth 3 -type d -name "$p" 2>/dev/null | head -1)
+            if [ -n "$hit" ]; then echo "FOUND  $p  ->  $hit"; else echo "MISS   $p"; fi
+          done | tee plugin-found.txt
+
+      - name: 写入 .config.seed
+        run: |
+          cat > .config.seed <<'SEED'
+          # ---- 机型 ----
+          CONFIG_TARGET_mediatek=y
+          CONFIG_TARGET_mediatek_filogic=y
+          CONFIG_TARGET_mediatek_filogic_DEVICE_tplink_tl-7dr7299-v1=y
+
+          # ---- 构建 ----
+          CONFIG_DEVEL=y
+          CONFIG_CCACHE=y
+          CONFIG_KERNEL_CFLAGS="-O2 -pipe -mcpu=cortex-a73"
+          CONFIG_luci_default_english=n
+          CONFIG_LUCI_LANG_zh_Hans=y
+          CONFIG_PACKAGE_luci-i18n-base-zh-cn=y
+
+          # ---- LuCI 基础 ----
+          CONFIG_PACKAGE_luci=y
+          CONFIG_PACKAGE_luci-compat=y
+          CONFIG_PACKAGE_luci-app-firewall=y
+          CONFIG_PACKAGE_luci-app-package-manager=y
+          CONFIG_PACKAGE_luci-app-opkg=y
+          CONFIG_PACKAGE_luci-app-attendedsysupgrade=n
+          CONFIG_PACKAGE_luci-app-commands=y
+          CONFIG_PACKAGE_luci-app-ddns=y
+          CONFIG_PACKAGE_luci-app-upnp=y
+          CONFIG_PACKAGE_luci-app-autoreboot=y
+          CONFIG_PACKAGE_luci-proto-ppp=y
+          CONFIG_PACKAGE_luci-proto-ipv6=y
+
+          # ---- 网页终端 TTYD（浏览器里直接开 shell，菜单 LuCI→服务→TTYD 终端）----
+          # 网页版终端：http://管理IP:7681 ；登录用户名密码就是路由 root 密码
+          CONFIG_PACKAGE_luci-app-ttyd=y
+          CONFIG_PACKAGE_ttyd=y
+          CONFIG_PACKAGE_luci-i18n-ttyd-zh-cn=y
+
+          # ---- IPv6 / 代理前置依赖 ----
+          CONFIG_IPV6=y
+          CONFIG_PACKAGE_ip-full=y
+          CONFIG_PACKAGE_ipset=y
+          CONFIG_PACKAGE_iptables-mod-tproxy=y
+          CONFIG_PACKAGE_iptables-mod-extra=y
+          CONFIG_PACKAGE_kmod-ipt-tproxy=y
+          CONFIG_PACKAGE_kmod-ipt-extra=y
+          CONFIG_PACKAGE_kmod-inet-diag=y
+          CONFIG_PACKAGE_kmod-nf-tproxy=y
+          CONFIG_PACKAGE_kmod-nf-socket=y
+          CONFIG_PACKAGE_kmod-nft-tproxy=y
+          CONFIG_PACKAGE_kmod-nft-socket=y
+          CONFIG_PACKAGE_kmod-tun=y
+          CONFIG_PACKAGE_curl=y
+          CONFIG_PACKAGE_ca-certificates=y
+          CONFIG_PACKAGE_htop=y
+          CONFIG_PACKAGE_jq=y
+          CONFIG_PACKAGE_openssh-sftp-server=y
+
+          # ---- DNS（去广告 + OpenClash 共用，支持 nftset/ipset）----
+          CONFIG_PACKAGE_dnsmasq-full=y
+          CONFIG_PACKAGE_dnsmasq_full_ipset=y
+          CONFIG_PACKAGE_dnsmasq_full_nftset=y
+
+          # ---- 去广告（小体积，已去掉 AdGuard Home）----
+          CONFIG_PACKAGE_luci-app-adblock=y
+          CONFIG_PACKAGE_adblock=y
+          CONFIG_PACKAGE_luci-i18n-adblock-zh-cn=y
+          # 备选（更省空间，约 0.3MB）：
+          # CONFIG_PACKAGE_luci-app-simple-ac=y
+
+          # ---- OpenClash ----
+          CONFIG_PACKAGE_luci-app-openclash=y
+          CONFIG_PACKAGE_luci-i18n-openclash-zh-cn=y
+          CONFIG_PACKAGE_redsocks=y
+          CONFIG_PACKAGE_tcping=y
+
+          # ---- PassWall ----
+          CONFIG_PACKAGE_luci-app-passwall=y
+          CONFIG_PACKAGE_luci-i18n-passwall-zh-cn=y
+          CONFIG_PACKAGE_chinadns-ng=y
+          CONFIG_PACKAGE_dns2socks=y
+          CONFIG_PACKAGE_ipt2socks=y
+          CONFIG_PACKAGE_pdnsd-alt=y
+          # PassWall 后端开关（社区验证过的写法）
+          CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Xray=y
+          CONFIG_PACKAGE_luci-app-passwall_INCLUDE_V2ray_Geodata=y
+          # 体积大的后端先关掉，容量够再打开
+          CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Haproxy=n
+          CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Hysteria=n
+          CONFIG_PACKAGE_luci-app-passwall_INCLUDE_NaiveProxy=n
+          CONFIG_PACKAGE_luci-app-passwall_INCLUDE_SingBox=n
+          CONFIG_PACKAGE_luci-app-passwall_INCLUDE_tuic_client=n
+          CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Shadow_TLS=n
+
+          # ---- 网络加速（MTK 硬件 NAT / TurboACC）----
+          CONFIG_PACKAGE_kmod-mediatek_hnat=y
+          CONFIG_PACKAGE_luci-app-turboacc=y
+          CONFIG_PACKAGE_turboacc-collection=y
+          # 注意：TPROXY 透明代理与硬件加速会互相干扰，跑代理时在界面里关掉加速
+
+          # ---- USB / 存储（做 extroot 或 U 盘共享用）----
+          CONFIG_PACKAGE_kmod-usb-core=y
+          CONFIG_PACKAGE_kmod-usb-ohci=y
+          CONFIG_PACKAGE_kmod-usb2=y
+          CONFIG_PACKAGE_kmod-usb3=y
+          CONFIG_PACKAGE_kmod-usb-storage=y
+          CONFIG_PACKAGE_kmod-fs-ext4=y
+          CONFIG_PACKAGE_kmod-fs-vfat=y
+          CONFIG_PACKAGE_block-mount=y
+
+          # ---- 局域网共享（超出容量就先关，见 FLASH_SIZE.md）----
+          CONFIG_PACKAGE_luci-app-samba4=y
+          CONFIG_PACKAGE_luci-app-filebrowser=y
+          SEED
+
+          if [ "${{ matrix.variant }}" = "slim" ]; then
+            echo "--- slim 变体：关掉 samba4 / filebrowser / tcpdump 等大体积项"
+            sed -i -E 's/^(CONFIG_PACKAGE_(luci-app-samba4|luci-app-filebrowser)=)y$/\1n/' .config.seed
+          fi
+          echo "=== .config.seed (${{ matrix.variant }}) ==="; cat .config.seed
+
+      # 把自定义网络设置打进 rootfs：files/ 目录会被自动拷进固件
+      # /etc/uci-defaults/ 下的脚本首次开机执行一次，成功后系统自动删除
+      - name: 写入开机网络设置（LAN 地址 + 光口当 WAN）
+        run: |
+          mkdir -p files/etc/uci-defaults
+          cat > files/etc/uci-defaults/99-custom-net <<'NETEOF'
+          #!/bin/sh
+          # 由 GitHub Actions 生成：改 LAN 管理地址 / 把指定网口改成 WAN
+          # 只在第一次开机时执行一次；想改回来在 LuCI 界面或 uci 里手动改即可
+          LAN_IP="__LAN_IP__"
+          WAN_DEV="__WAN_DEV__"
+          WAN_PROTO="__WAN_PROTO__"
+          WAN_VLAN="__WAN_VLAN__"
+          WAN_USER="__WAN_USER__"
+          WAN_PASS="__WAN_PASS__"
+          LAN_EXTRA="__LAN_EXTRA__"
+
+          if [ -n "$LAN_IP" ] && [ "$LAN_IP" != "none" ]; then
+            uci set network.lan.proto='static'
+            uci set network.lan.ipaddr="$LAN_IP"
+            uci set network.lan.netmask='255.255.255.0'
+          fi
+
+          if [ -n "$WAN_DEV" ]; then
+            # 目标网口从 lan 桥里摘出来，避免同一个口既在 lan 又在 wan
+            # 新版 network 配置里桥端口在 config device 段，老版在 lan 接口的 ports/ifname，两种都处理
+            uci -q del_list network.lan.ports="$WAN_DEV"
+            uci -q del_list network.lan.ifname="$WAN_DEV"
+            for s in $(uci -q show network | sed -n "s/^\(network\.[^ ]*\)\.name=.br-lan.$/\1/p"); do
+              uci -q del_list "$s.ports=$WAN_DEV"
+              # 空出来的网口（默认 eth1，它原本是默认 WAN）加回 lan，先删再加防止重复
+              for p in $LAN_EXTRA; do
+                uci -q del_list "$s.ports=$p"
+                uci -q add_list "$s.ports=$p"
+              done
+            done
+            for p in $LAN_EXTRA; do
+              uci -q del_list network.lan.ports="$p"
+              uci -q add_list network.lan.ports="$p"
+            done
+            # wan 接口不存在就补一个
+            uci -q show network.wan >/dev/null || uci set network.wan='interface'
+            DEV="$WAN_DEV"
+            if [ -n "$WAN_VLAN" ]; then
+              # 需要打 802.1q tag：建一个 wanvlan 设备，wan 绑到它上面
+              uci set network.wanvlan='device'
+              uci set network.wanvlan.type='8021q'
+              uci set network.wanvlan.ifname="$WAN_DEV"
+              uci set network.wanvlan.vid="$WAN_VLAN"
+              uci set network.wanvlan.name="$WAN_DEV.$WAN_VLAN"
+              DEV="$WAN_DEV.$WAN_VLAN"
+            fi
+            uci set network.wan.device="$DEV"
+            uci -q delete network.wan.ifname
+            [ -n "$WAN_PROTO" ] && uci set network.wan.proto="$WAN_PROTO"
+            if [ "$WAN_PROTO" = "pppoe" ] && [ -n "$WAN_USER" ]; then
+              uci set network.wan.username="$WAN_USER"
+              uci set network.wan.password="$WAN_PASS"
+            fi
+          fi
+
+          uci commit network
+          sync
+          exit 0
+          NETEOF
+          sed -i -e "s|__LAN_IP__|${{ inputs.lan_ip }}|g" \
+                 -e "s|__WAN_DEV__|${{ inputs.wan_device }}|g" \
+                 -e "s|__WAN_PROTO__|${{ inputs.wan_proto }}|g" \
+                 -e "s|__WAN_VLAN__|${{ inputs.wan_vlan }}|g" \
+                 -e "s|__WAN_USER__|${{ inputs.wan_user }}|g" \
+                 -e "s|__WAN_PASS__|${{ inputs.wan_pass }}|g" \
+                 -e "s|__LAN_EXTRA__|${{ inputs.lan_extra_ports }}|g" \
+                 files/etc/uci-defaults/99-custom-net
+          chmod +x files/etc/uci-defaults/99-custom-net
+          echo "=== 生成的开机脚本（确认 IP 和 WAN 口是否是你想要的）==="
+          cat files/etc/uci-defaults/99-custom-net
+
+      - name: 生成 .config
+        run: |
+          rm -f .config .config.old
+          make defconfig
+          cat .config.seed >> .config
+          make defconfig
+          echo "=== 关键包是否被保留（MISS 就是当前 feeds 里没有这个包）==="
+          for p in luci luci-app-adblock adblock luci-app-openclash luci-app-passwall \
+                   luci-app-turboacc kmod-mediatek_hnat dnsmasq-full chinadns-ng \
+                   luci-app-samba4 kmod-usb3 istore luci-app-ttyd ttyd; do
+            if grep -q "^CONFIG_PACKAGE_$p=y" .config; then echo "OK    $p"; else echo "MISS  $p"; fi
+          done | tee package-check.txt
+          echo "=== 机型 ==="; grep -E "^CONFIG_TARGET_mediatek" .config
+
+      - name: 缓存 ccache
+        if: inputs.diagnose_only == 'no'
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-${{ inputs.repository }}-${{ inputs.branch }}-${{ matrix.variant }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ inputs.repository }}-${{ inputs.branch }}-${{ matrix.variant }}-
+            ccache-${{ inputs.repository }}-${{ inputs.branch }}-
+
+      - name: 下载源码包
+        if: inputs.diagnose_only == 'no'
+        run: |
+          make download -j2 || make download -j1
+          find dl -size -1024c -exec rm -f {} \; || true
+
+      - name: 编译固件
+        if: inputs.diagnose_only == 'no'
+        run: |
+          # 分三步编，出错能马上定位：tools → toolchain → 全量。
+          # 任何一步失败：自动认出出错的那个包，清理后用「单线程 + V=s」重编它（安静并行模式会把真正的报错藏起来），
+          # 单线程能过就继续编剩下的；过不了就把最后 500 行留在这里，发我即可定位。
+          set -o pipefail
+          retry () {
+            LOG="$1"; shift
+            FAIL=$(grep -m1 -oE "[a-z_]+/[a-z0-9_./+-]+ failed to build" "$LOG" | sed 's/ failed to build//')
+            if echo "$FAIL" | grep -qE '^(tools|package|toolchain)/'; then
+              echo "::warning::出错的是 $FAIL —— 清理后单线程 + V=s 重编它（下面只打印最后 500 行）"
+              make "$FAIL/clean" >/dev/null 2>&1 || true
+              make -j1 V=s "$FAIL/compile" 2>&1 | tee -a "$LOG" | tail -n 500 || return 1
+              echo "=== $FAIL 单线程编过了，继续并行编剩下的（已完成的会自动跳过）==="
+              make -j$(nproc) -e IGNORE_ERRORS=1 "$@" 2>&1 | tee -a "$LOG" | tail -n 200
+            else
+              echo "::warning::日志里认不出具体包名，改用单线程 + V=s 重跑（已完成的会自动跳过）"
+              make -j1 V=s "$@" 2>&1 | tee -a "$LOG" | tail -n 500
+            fi
+          }
+          echo "=== 第 1 步：先编 tools（tools 阶段最容易出问题，单独编最快、日志也短）==="
+          if ! make -j$(nproc) tools/compile 2>&1 | tee build-tools.log; then
+            retry build-tools.log tools/compile || exit 1
+          fi
+          echo "=== 第 2 步：再编 toolchain（交叉编译器）==="
+          if ! make -j$(nproc) toolchain/compile 2>&1 | tee build-toolchain.log; then
+            retry build-toolchain.log toolchain/compile || exit 1
+          fi
+          echo "=== 第 3 步：全量编译 ${{ matrix.variant }}（$(nproc) 线程）==="
+          if ! make -j$(nproc) -e IGNORE_ERRORS=1 2>&1 | tee build.log; then
+            retry build.log || exit 1
+          fi
+          echo "=== 编译结束 ==="
+
+      - name: 容量核对
+        if: inputs.diagnose_only == 'no'
+        run: |
+          OVERLAY_MB="${{ inputs.overlay_mb }}"
+          echo "=== 未压缩 rootfs 体积 ==="
+          ROOTFS=$(du -sm build_dir/target-*/rootfs-*/ 2>/dev/null | awk '{print $1; exit}')
+          echo "rootfs ≈ ${ROOTFS} MB  （overlay 可用约 ${OVERLAY_MB} MB）"
+          echo "=== 固件产物 ==="
+          for f in bin/targets/mediatek/filogic/*7dr7299*; do
+            [ -f "$f" ] || continue
+            printf "%8s MB  %s\n" "$(stat -c%s "$f" | awk '{printf "%.1f", $1/1048576}')" "$f"
+          done
+          NEED=$(( ROOTFS + ROOTFS / 10 ))
+          if [ -n "$ROOTFS" ] && [ "$NEED" -gt "$OVERLAY_MB" ]; then
+            echo "::warning::rootfs ${ROOTFS}MB 装不进 ${OVERLAY_MB}MB 的 overlay。裁剪顺序：samba4/filebrowser → passwall 大后端 → USB 存储 → 主题 → USB extroot（见 FLASH_SIZE.md）"
+          fi
+
+      - name: 刷机后访问信息
+        if: inputs.diagnose_only == 'no'
+        run: |
+          echo "=== 刷完机怎么进系统 ==="
+          echo "管理页面 : http://${{ inputs.lan_ip }}   （用户名 root，密码是第一次进 Web 界面时自己设的）"
+          echo "网页终端 : http://${{ inputs.lan_ip }}:7681   （TTYD，同一个密码）"
+          echo "SSH      : ssh root@${{ inputs.lan_ip }}"
+          echo "WAN 口   : ${{ inputs.wan_device }}   协议=${{ inputs.wan_proto }}   VLAN=${{ inputs.wan_vlan }}   LAN 追加口=${{ inputs.lan_extra_ports }}"
+          echo "注意：光口能不能拨号，前提是光模块已经在运营商侧注册过（OMCI/业务配置一般靠原厂界面或运营商下发）。"
+          echo "      wan 起不来时先跑：ifstatus wan ；logread | grep -i wan ；ip link  看是哪一环失败（最常见是缺 VLAN tag）。"
+
+      - name: 上传固件
+        if: inputs.diagnose_only == 'no'
+        uses: actions/upload-artifact@v4
+        with:
+          name: openwrt-7dr7299-${{ matrix.variant }}
+          path: |
+            bin/targets/mediatek/filogic/*.itb
+            bin/targets/mediatek/filogic/*.bin
+            bin/targets/mediatek/filogic/*.sha256sums
+            bin/targets/mediatek/filogic/*.manifest
+            bin/targets/mediatek/filogic/config.buildinfo
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: 上传体检报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: report-${{ matrix.variant }}
+          path: |
+            plugin-found.txt
+            package-check.txt
+            .config.seed
+            .config
+            files/etc/uci-defaults/99-custom-net
+          retention-days: 14
+
+      - name: 失败时上传日志
+        if: failure()
+        run: |
+          echo "=== 磁盘剩余（编译失败有时只是因为没空间）==="
+          df -h / ; df -h . ; du -sh staging_dir build_dir dl 2>/dev/null || true
+          echo "=== 出错的那个包的日志文件（如果有）==="
+          ls -la staging_dir/*.txt logs/*.txt 2>/dev/null || true
+          for f in staging_dir/*.txt logs/*.txt; do
+            [ -f "$f" ] || continue
+            echo "--- $f （最后 120 行）"; tail -n 120 "$f"
+          done
+
+      - name: 上传失败日志
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: log-${{ matrix.variant }}
+          path: |
+            build.log
+            build-tools.log
+            build-toolchain.log
+            tmp/.config-package.in
+            tmp/info/.packageinfo-*
+          retention-days: 7
